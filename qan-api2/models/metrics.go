@@ -56,77 +56,81 @@ func NewMetrics(db *sqlx.DB) Metrics {
 // If totals = true, the function will retuen only totals and it will skip filters
 // to differentiate it from empty filters.
 func (m *Metrics) Get(ctx context.Context, periodStartFromSec, periodStartToSec int64, filter, group string,
-	dimensions, labels map[string][]string, totals bool,
+    dimensions, labels map[string][]string, totals bool,
 ) ([]M, error) {
-	arg := map[string]interface{}{
-		"period_start_from": periodStartFromSec,
-		"period_start_to":   periodStartToSec,
-	}
+    arg := map[string]interface{}{
+        "period_start_from": periodStartFromSec,
+        "period_start_to":   periodStartToSec,
+    }
 
-	tmplArgs := struct {
-		PeriodStartFrom int64
-		PeriodStartTo   int64
-		PeriodDuration  int64
-		Dimensions      map[string][]string
-		Labels          map[string][]string
-		DimensionVal    string
-		Group           string
-		Totals          bool
-	}{
-		PeriodStartFrom: periodStartFromSec,
-		PeriodStartTo:   periodStartToSec,
-		PeriodDuration:  periodStartToSec - periodStartFromSec,
-		Dimensions:      escapeColonsInMap(dimensions),
-		Labels:          escapeColonsInMap(labels),
-		DimensionVal:    escapeColons(filter),
-		Group:           group,
-		Totals:          totals,
-	}
-	var queryBuffer bytes.Buffer
-	if tmpl, err := template.New("queryMetricsTmpl").Funcs(funcMap).Parse(queryMetricsTmpl); err != nil {
-		log.Fatalln(err)
-	} else if err = tmpl.Execute(&queryBuffer, tmplArgs); err != nil {
-		log.Fatalln(err)
-	}
-	var results []M
-	query, args, err := sqlx.Named(queryBuffer.String(), arg)
-	if err != nil {
-		return results, errors.Wrap(err, cannotPrepare)
-	}
-	query, args, err = sqlx.In(query, args...)
-	if err != nil {
-		return results, errors.Wrap(err, cannotPopulate)
-	}
-	query = m.db.Rebind(query)
+    tmplArgs := struct {
+        PeriodStartFrom int64
+        PeriodStartTo   int64
+        PeriodDuration  int64
+        Dimensions      map[string][]string
+        Labels          map[string][]string
+        DimensionVal    string
+        Group           string
+        Totals          bool
+    }{
+        PeriodStartFrom: periodStartFromSec,
+        PeriodStartTo:   periodStartToSec,
+        PeriodDuration:  periodStartToSec - periodStartFromSec,
+        Dimensions:      escapeColonsInMap(dimensions),
+        Labels:          escapeColonsInMap(labels),
+        DimensionVal:    escapeColons(filter),
+        Group:           group,
+        Totals:          totals,
+    }
+    var queryBuffer bytes.Buffer
+    if tmpl, err := template.New("queryMetricsTmpl").Funcs(funcMap).Parse(queryMetricsTmpl); err != nil {
+        log.Fatalln(err)
+    } else if err = tmpl.Execute(&queryBuffer, tmplArgs); err != nil {
+        log.Fatalln(err)
+    }
 
-	queryCtx, cancel := context.WithTimeout(ctx, queryTimeout)
-	defer cancel()
+    // Log the query before executing it
+    logQuery(queryBuffer.String(), arg)
 
-	rows, err := m.db.QueryxContext(queryCtx, query, args...)
-	if err != nil {
-		return results, errors.Wrap(err, cannotExecute)
-	}
-	defer rows.Close() //nolint:errcheck
+    var results []M
+    query, args, err := sqlx.Named(queryBuffer.String(), arg)
+    if err != nil {
+        return results, errors.Wrap(err, cannotPrepare)
+    }
+    query, args, err = sqlx.In(query, args...)
+    if err != nil {
+        return results, errors.Wrap(err, cannotPopulate)
+    }
+    query = m.db.Rebind(query)
 
-	for rows.Next() {
-		result := make(M)
-		err = rows.MapScan(result)
-		if err != nil {
-			logrus.Errorf("DimensionMetrics Scan error: %v", err)
-		}
-		results = append(results, result)
-	}
-	rows.NextResultSet()
-	total := make(M)
-	for rows.Next() {
-		err = rows.MapScan(total)
-		if err != nil {
-			logrus.Errorf("DimensionMetrics Scan TOTALS error: %v", err)
-		}
-		results = append(results, total)
-	}
+    queryCtx, cancel := context.WithTimeout(ctx, queryTimeout)
+    defer cancel()
 
-	return results, err
+    rows, err := m.db.QueryxContext(queryCtx, query, args...)
+    if err != nil {
+        return results, errors.Wrap(err, cannotExecute)
+    }
+    defer rows.Close() //nolint:errcheck
+
+    for rows.Next() {
+        result := make(M)
+        err = rows.MapScan(result)
+        if err != nil {
+            logrus.Errorf("DimensionMetrics Scan error: %v", err)
+        }
+        results = append(results, result)
+    }
+    rows.NextResultSet()
+    total := make(M)
+    for rows.Next() {
+        err = rows.MapScan(total)
+        if err != nil {
+            logrus.Errorf("DimensionMetrics Scan TOTALS error: %v", err)
+        }
+        results = append(results, total)
+    }
+
+    return results, err
 }
 
 const queryMetricsTmpl = `
@@ -1010,22 +1014,26 @@ func (m *Metrics) SchemaByQueryID(ctx context.Context, serviceID, queryID string
 	}
 	defer rows.Close() //nolint:errcheck
 
-	res := &qanpb.SchemaByQueryIDReply{}
-	for rows.Next() {
-		err = rows.Scan(&res.Schema)
-		if err != nil {
-			return res, errors.Wrap(err, "failed to scan query")
-		}
+    res := &qanpb.SchemaByQueryIDReply{}
+    for rows.Next() {
+        err = rows.Scan(&res.Schema)
+        if err != nil {
+            return res, errors.Wrap(err, "failed to scan query")
+        }
+    }
 
-		return res, nil //nolint:staticcheck
-	}
-
-	return res, nil
+    return res, nil
 }
 
 const queryByQueryIDTmpl = `SELECT explain_fingerprint, fingerprint, example, placeholders_count FROM metrics
 WHERE service_id = :service_id AND queryid = :query_id LIMIT 1;
 `
+func logQuery(query string, args map[string]interface{}) {
+    logrus.WithFields(logrus.Fields{
+        "query": query,
+        "args":  args,
+    }).Info("Executing query")
+}
 
 // ExplainFingerprintByQueryID get explain fingerprint and placeholders count for given queryid.
 func (m *Metrics) ExplainFingerprintByQueryID(ctx context.Context, serviceID, queryID string) (*qanpb.ExplainFingerprintByQueryIDReply, error) {
@@ -1035,7 +1043,8 @@ func (m *Metrics) ExplainFingerprintByQueryID(ctx context.Context, serviceID, qu
 	}
 
 	var queryBuffer bytes.Buffer
-	queryBuffer.WriteString(queryByQueryIDTmpl)
+    queryBuffer.WriteString(queryByQueryIDTmpl)
+    logQuery(queryBuffer.String(), arg)
 
 	res := &qanpb.ExplainFingerprintByQueryIDReply{}
 	query, args, err := sqlx.Named(queryBuffer.String(), arg)
@@ -1059,30 +1068,28 @@ func (m *Metrics) ExplainFingerprintByQueryID(ctx context.Context, serviceID, qu
 
 	var fingerprint, example string
 	for rows.Next() {
-		err = rows.Scan(
-			&res.ExplainFingerprint,
-			&fingerprint,
-			&example,
-			&res.PlaceholdersCount)
-		if err != nil {
-			return res, errors.Wrap(err, "failed to scan query")
-		}
+        err = rows.Scan(
+            &res.ExplainFingerprint,
+            &fingerprint,
+            &example,
+            &res.PlaceholdersCount)
+        if err != nil {
+            return res, errors.Wrap(err, "failed to scan query")
+        }
 
-		if example != "" {
-			res.ExplainFingerprint = example
-			res.PlaceholdersCount = 0
+        if example != "" {
+            res.ExplainFingerprint = example
+            res.PlaceholdersCount = 0
+        } else if res.ExplainFingerprint == "" {
+            res.ExplainFingerprint = fingerprint
+        }
+    }
 
-			return res, nil
-		}
+    if res.ExplainFingerprint == "" {
+        return res, errors.New("query_id doesnt exists")
+    }
 
-		if res.ExplainFingerprint == "" {
-			res.ExplainFingerprint = fingerprint
-		}
-
-		return res, nil //nolint:staticcheck
-	}
-
-	return res, errors.New("query_id doesnt exists")
+    return res, nil
 }
 
 const selectedQueryMetadataTmpl = `
@@ -1177,39 +1184,39 @@ func (m *Metrics) GetSelectedQueryMetadata(ctx context.Context, periodStartFromS
 		metadata[name] = make(map[string]struct{})
 	}
 
-	for rows.Next() {
-		row := make([]any, len(columnNames))
-		for i := range columnNames {
-			row[i] = new(string)
-		}
+    for rows.Next() {
+        row := make([]any, len(columnNames))
+        for i := range columnNames {
+            row[i] = new(string)
+        }
 
-		err = rows.Scan(row...)
-		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return nil, errors.Wrap(err, "query_id doesnt exists")
-			}
-			return nil, errors.Wrap(err, "failed to scan query")
-		}
+        err = rows.Scan(row...)
+        if err != nil {
+            if errors.Is(err, sql.ErrNoRows) {
+                return nil, errors.Wrap(err, "query_id doesnt exists")
+            }
+            return nil, errors.Wrap(err, "failed to scan query")
+        }
 
-		for k, v := range row {
-			if value, ok := v.(*string); ok {
-				metadata[columnNames[k]][*value] = struct{}{}
-			}
-		}
-	}
+        for k, v := range row {
+            if value, ok := v.(*string); ok {
+                metadata[columnNames[k]][*value] = struct{}{}
+            }
+        }
+    }
 
-	res.ServiceName = prepareMetadataProperty(metadata["service_name"])
-	res.Database = prepareMetadataProperty(metadata["database"])
-	res.Schema = prepareMetadataProperty(metadata["schema"])
-	res.Username = prepareMetadataProperty(metadata["username"])
-	res.ReplicationSet = prepareMetadataProperty(metadata["replication_set"])
-	res.Cluster = prepareMetadataProperty(metadata["cluster"])
-	res.ServiceType = prepareMetadataProperty(metadata["service_type"])
-	res.Environment = prepareMetadataProperty(metadata["environment"])
-	res.NodeName = prepareMetadataProperty(metadata["node_name"])
-	res.NodeType = prepareMetadataProperty(metadata["node_type"])
+    res.ServiceName = prepareMetadataProperty(metadata["service_name"])
+    res.Database = prepareMetadataProperty(metadata["database"])
+    res.Schema = prepareMetadataProperty(metadata["schema"])
+    res.Username = prepareMetadataProperty(metadata["username"])
+    res.ReplicationSet = prepareMetadataProperty(metadata["replication_set"])
+    res.Cluster = prepareMetadataProperty(metadata["cluster"])
+    res.ServiceType = prepareMetadataProperty(metadata["service_type"])
+    res.Environment = prepareMetadataProperty(metadata["environment"])
+    res.NodeName = prepareMetadataProperty(metadata["node_name"])
+    res.NodeType = prepareMetadataProperty(metadata["node_type"])
 
-	return res, nil
+    return res, nil
 }
 
 func prepareMetadataProperty(metadata map[string]struct{}) string {
